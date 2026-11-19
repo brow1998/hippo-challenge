@@ -1,155 +1,80 @@
+"""Entry point: `hippo` reads the three sources and writes every output."""
+
+from __future__ import annotations
+
 import argparse
+import json
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
-from hippo import data_loader, metrics, quantities, recommendations
+from hippo import load, transform
 
-
-def validate_data() -> bool:
-    """
-    Loads all data and logs the number of valid rows for each dataset.
-
-    Returns:
-        bool: `True` if all datasets have valid data, `False` otherwise.
-    """
-    data = data_loader.load_all_data()
-    valid = True
-    for key, df in data.items():
-        if df.empty:
-            logging.error(f"No valid data found for {key}.")
-            valid = False
-        else:
-            logging.info(f"{key.capitalize()} data: {len(df)} valid rows.")
-    if valid:
-        logging.info("All datasets validated successfully.")
-    else:
-        logging.error("Some datasets have issues.")
-    return valid
+log = logging.getLogger("hippo")
 
 
-def generate_metrics(output_dir: str):
-    """
-    Generates metrics from claims and reverts data and saves the result to a JSON file.
-
-    Parameters:
-        output_dir (str): Directory where the output file will be saved.
-    """
-    data = data_loader.load_all_data()
-    claims_df = data.get("claims")
-    reverts_df = data.get("reverts")
-    if claims_df.empty:
-        logging.error("No claims data available for metrics computation.")
-        return
-    metrics_df = metrics.compute_metrics(claims_df, reverts_df)
-    if metrics_df.empty:
-        logging.error("Metrics computation resulted in an empty dataset.")
-    else:
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, "metrics.json")
-        metrics_df.to_json(output_path, orient="records", indent=4)
-        logging.info(f"Metrics saved to {output_path}")
+def _write(path: Path, payload) -> None:
+    """Write JSON atomically so a crash never leaves a half-written output."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
-def generate_recommendations(output_dir: str):
-    """
-    Generates top 2 chain recommendations per drug and saves the result to a JSON file.
+def run(pharmacies: list[str], claims: list[str], reverts: list[str], output: str) -> dict:
+    """Run the whole pipeline and return the run summary."""
+    with ProcessPoolExecutor() as pool:
+        loaded = {
+            name: load.load(name, dirs, pool)
+            for name, dirs in (("pharmacies", pharmacies), ("claims", claims), ("reverts", reverts))
+        }
 
-    Parameters:
-        output_dir (str): Directory where the output file will be saved.
-    """
-    data = data_loader.load_all_data()
-    pharmacies_df = data.get("pharmacies")
-    claims_df = data.get("claims")
-    if claims_df.empty or pharmacies_df.empty:
-        logging.error("Insufficient data to compute recommendations.")
-        return
-    top_chains = recommendations.compute_top_chains(claims_df, pharmacies_df)
-    if not top_chains:
-        logging.error("Recommendations computation resulted in an empty dataset.")
-    else:
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, "top_chains.json")
-        recommendations.save_top_chains(top_chains, output_path)
-        logging.info(f"Recommendations saved to {output_path}")
+    in_scope, out_of_scope = transform.scope(loaded["claims"].rows, loaded["pharmacies"].rows, loaded["reverts"].rows)
 
+    rejected = [r for source in loaded.values() for r in source.rejected]
+    rejected += [
+        {
+            "source": "claims",
+            "source_file": r.source_file,
+            "source_row": int(r.source_row),
+            "reason": "npi not in pharmacy dataset",
+        }
+        for r in out_of_scope.itertuples()
+    ]
+    rejected.sort(key=lambda r: (r["source"], r["source_file"], r["source_row"] if r["source_row"] is not None else -1))
 
-def generate_common_quantities(output_dir: str):
-    """
-    Generates the most common prescription quantities per drug and saves the result to a JSON file.
+    summary = {
+        "pharmacies": len(loaded["pharmacies"].rows),
+        "claims_valid": len(loaded["claims"].rows),
+        "claims_in_scope": len(in_scope),
+        "claims_reverted": int(in_scope["reverted"].sum()) if len(in_scope) else 0,
+        "reverts_valid": len(loaded["reverts"].rows),
+        "rejected": len(rejected),
+    }
 
-    Parameters:
-        output_dir (str): Directory where the output file will be saved.
-    """
-    data = data_loader.load_all_data()
-    claims_df = data.get("claims")
-    if claims_df.empty:
-        logging.error("No claims data available for common quantities computation.")
-        return
-    common_quantities = quantities.compute_common_quantities(claims_df)
-    if not common_quantities:
-        logging.error("Common quantities computation resulted in an empty dataset.")
-    else:
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, "most_prescribed_quantities.json")
-        quantities.save_common_quantities(common_quantities, output_path)
-        logging.info(f"Common quantities saved to {output_path}")
+    out = Path(output)
+    out.mkdir(parents=True, exist_ok=True)
+    _write(out / "metrics.json", transform.metrics(in_scope))
+    _write(out / "top_chains.json", transform.top_chains(in_scope, loaded["pharmacies"].rows))
+    _write(out / "most_prescribed_quantities.json", transform.common_quantities(in_scope))
+    _write(out / "rejected.json", rejected)
+    _write(out / "run_summary.json", summary)
+    return summary
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Hippo - Data Processing CLI")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="hippo", description=__doc__)
+    parser.add_argument("--pharmacies", nargs="+", default=["data/input/pharmacies"], help="pharmacy CSV directories")
+    parser.add_argument("--claims", nargs="+", default=["data/input/claims"], help="claim event JSON directories")
+    parser.add_argument("--reverts", nargs="+", default=["data/input/reverts"], help="revert event JSON directories")
+    parser.add_argument("--output", default="output", help="where the JSON outputs are written")
+    args = parser.parse_args(argv)
 
-    parser_validate = subparsers.add_parser(
-        "validate", help="Validate input data files."
-    )
-
-    parser_metrics = subparsers.add_parser(
-        "metrics", help="Generate metrics from data."
-    )
-    parser_metrics.add_argument(
-        "--output", type=str, default="data/output", help="Output directory for metrics."
-    )
-
-    parser_recommend = subparsers.add_parser(
-        "recommend", help="Generate top 2 chain recommendations per drug."
-    )
-    parser_recommend.add_argument(
-        "--output",
-        type=str,
-        default="data/output",
-        help="Output directory for recommendations.",
-    )
-
-    parser_common = subparsers.add_parser(
-        "common", help="Generate most common prescription quantities per drug."
-    )
-    parser_common.add_argument(
-        "--output",
-        type=str,
-        default="data/output",
-        help="Output directory for common quantities.",
-    )
-
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-
-    if args.command == "validate":
-        valid = validate_data()
-        if valid:
-            logging.info("Data validation completed successfully.")
-        else:
-            logging.error("Data validation encountered issues.")
-    elif args.command == "metrics":
-        generate_metrics(args.output)
-    elif args.command == "recommend":
-        generate_recommendations(args.output)
-    elif args.command == "common":
-        generate_common_quantities(args.output)
-    else:
-        parser.print_help()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    summary = run(args.pharmacies, args.claims, args.reverts, args.output)
+    for key, value in summary.items():
+        log.info("%-16s %s", key, value)
+    log.info("outputs written to %s/", args.output)
 
 
 if __name__ == "__main__":

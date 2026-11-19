@@ -1,108 +1,91 @@
-# Hippo
+# hippo
 
-Hippo processes data from pharmacies, claims, and reverts to compute metrics, generate recommendations for the top 2 chains per drug, and identify the most common prescription quantities.
+[![ci](https://github.com/brow1998/hippo-challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/brow1998/hippo-challenge/actions/workflows/ci.yml)
 
-## Project Overview
+A small pharmacy claims pipeline. It reads a pharmacy registry and two event streams (claims and
+reverts), throws out what doesn't fit the schema, and answers three business questions:
 
-Hippo is designed to process and analyze healthcare data. The application performs the following tasks:
+1. **How does each pharmacy perform per drug?** Fills, reverts, average unit price, total price.
+2. **Which two chains are cheapest for each drug?** Ranked by average unit price.
+3. **What quantities are prescribed most for each drug?** Ordered by frequency.
 
-1. **Data Loading and Validation:**
+The problem statement is in [`instructions/`](instructions/01-data-project.md).
 
-   Reads and validates data from three sources:
+## Quick start
 
-   * Pharmacies (CSV)
-   * Claims (JSON)
-   * Reverts (JSON)
-2. **Metrics Computation:**
+Needs [uv](https://docs.astral.sh/uv/). One command, from a clean checkout:
 
-   Computes various metrics such as:
+```bash
+uv run hippo
+```
 
-   * Count of claims (fills)
-   * Total price of claims (rounded)
-   * Average unit price (rounded)
-   * Count of reverts
-3. **Recommendations:**
+That reads the sample data in `data/input/` and writes five files to `output/`:
 
-   For each drug (`ndc`), the project identifies the top 2 chains (from pharmacy data) with the lowest average unit price.
+| File | What's in it |
+|---|---|
+| `metrics.json` | Fills, reverts, average unit price and total price per `npi` × `ndc` |
+| `top_chains.json` | The two cheapest chains per drug |
+| `most_prescribed_quantities.json` | Prescribed quantities per drug, most frequent first |
+| `rejected.json` | Every row that didn't make it, with its file, row number and reason |
+| `run_summary.json` | Row counts for the run |
 
-4. **Common Prescription Quantities:**
+Point it at other data with one or more directories per source:
 
-   Identifies the most common prescription quantities per drug.
+```bash
+uv run hippo --pharmacies a/ --claims b/ c/ --reverts d/ --output out/
+```
 
-## Installation
+On the sample data:
 
-1. **Clone the repository:**
+```text
+INFO pharmacies       17
+INFO claims_valid     27073
+INFO claims_in_scope  22988
+INFO claims_reverted  260
+INFO reverts_valid    305
+INFO rejected         4091
+```
 
-   ```bash
-   git clone https://github.com/brow1998/hippo-challenge.git
-   cd hippo-challenge
-   ```
+## How it behaves
 
-2. **Create a virtual environment (optional but recommended):**
+**Running it twice gives the same answer.** Outputs are sorted with explicit tie-breakers and written
+atomically, so a second run produces byte-identical files. CI runs the pipeline twice and diffs the results.
 
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows use: venv\Scripts\activate
-   ```
+**Replayed events don't count twice.** Claims and reverts are streams, so the same event can arrive
+more than once. Events are keyed by `id`; repeats are rejected as duplicates. A claim reverted twice
+counts as one revert.
 
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+**Every rejected row has a receipt.** Each entry in `rejected.json` names the source file, the row
+index inside it and the reason: a missing or invalid field, a non-positive quantity, a negative price, a
+duplicate id, an unreadable file, or a pharmacy that isn't in the registry.
 
-## Usage
-Hippo provides a command-line interface (CLI) with the following commands:
+**A bad file doesn't stop the run.** It is logged as rejected and the rest of the data is processed.
 
-**validate**: Validate input data files.
+## Business rules
 
-**metrics**: Generate metrics from data.
+- Only claims from pharmacies in the pharmacy dataset are in scope.
+- A revert invalidates its claim. A reverted claim still counts as a fill and as a prescribed
+  quantity, but never contributes to `avg_price`, `total_price` or the chain ranking. A pharmacy and
+  drug pair whose claims were all reverted reports `avg_price: null`.
+- Unit price is `price / quantity`; `avg_price` is the mean unit price across claims.
+- File parsing runs in a process pool, one worker per core.
 
-**recommend**: Generate top 2 chain recommendations per drug.
+## Layout
 
-**common**: Generate the most common prescription quantities per drug.
+```text
+hippo/load.py        read, validate and deduplicate each source, keeping file and row receipts
+hippo/transform.py   the three outputs as pure functions over validated frames
+hippo/cli.py         wiring, atomic writes, run summary
+tests/               behaviour tests on small inline fixtures, no network
+```
 
-All commands accept a global argument --data to specify the base directory where the input data folders are located. By default, Hippo looks for data in the `data/input` directory.
+## Tests
 
-## Running the Commands
-### Validate Data
+```bash
+uv run pytest
+```
 
-To validate the input data, run:
+## License
 
-`python -m hippo.cli validate`
-
-data/input/pharmacies
-data/input/claims
-data/input/reverts
-and log the number of valid rows for each dataset.
-
-### Generate Metrics
-
-To generate metrics and save the results to a directory (default is output), run:
-
-`python -m hippo.cli metrics`
-
-This command computes the metrics from claims and reverts data and saves the result as metrics.json in the specified output directory.
-
-### Generate Recommendations
-
-To generate top 2 chain recommendations per drug, run:
-
-`python -m hippo.cli recommend`
-
-This command computes recommendations and saves the result as top_chains.json in the specified output directory.
-
-### Generate Common Quantities
-
-To generate the most common prescription quantities per drug, run:
-
-`python -m hippo.cli common`
-
-This command computes the common prescription quantities and saves the result as most_prescribed_quantities.json in the specified output directory.
-
-## Output
-
-After running the commands, the following output files will be generated in the specified (or default) output directory:
-
-**metrics.json**: Computed metrics from claims and reverts.
-**top_chains.json**: Top 2 chains per drug based on average unit price.
-**most_prescribed_quantities.json**: Most common prescription quantities per drug.
+[MIT](LICENSE) covers the code in this repository. The problem statement and sample data in
+`instructions/` and `data/input/` belong to their authors.

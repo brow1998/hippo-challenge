@@ -1,5 +1,6 @@
-.ruff*
-.venv*
-pycache*
-__pycache__*
+.venv/
+__pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+output/

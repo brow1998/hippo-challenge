@@ -1,0 +1,25 @@
+[project]
+name = "hippo"
+version = "1.0.0"
+description = "Pharmacy claims pipeline: per-drug metrics, chain recommendations and common quantities"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["pandas>=2.2,<3"]
+
+[project.scripts]
+hippo = "hippo.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["instructions"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
